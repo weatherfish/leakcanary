@@ -48,6 +48,9 @@ public final class HeapAnalyzerService extends IntentService {
   }
 
   @Override protected void onHandleIntent(Intent intent) {
+    if (intent == null) {
+      return;
+    }
     String listenerClassName = intent.getStringExtra(LISTENER_CLASS_EXTRA);
     HeapDump heapDump = (HeapDump) intent.getSerializableExtra(HEAPDUMP_EXTRA);
 
