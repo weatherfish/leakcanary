@@ -15,45 +15,39 @@
  */
 package com.squareup.leakcanary;
 
-import android.util.Log;
+import com.squareup.haha.perflib.ArrayInstance;
+import com.squareup.haha.perflib.ClassInstance;
+import com.squareup.haha.perflib.ClassObj;
+import com.squareup.haha.perflib.Field;
+import com.squareup.haha.perflib.HprofParser;
+import com.squareup.haha.perflib.Instance;
+import com.squareup.haha.perflib.RootObj;
+import com.squareup.haha.perflib.RootType;
+import com.squareup.haha.perflib.Snapshot;
+import com.squareup.haha.perflib.Type;
+import com.squareup.haha.perflib.io.HprofBuffer;
+import com.squareup.haha.perflib.io.MemoryMappedFileBuffer;
+import com.squareup.haha.trove.THashMap;
+import com.squareup.haha.trove.TObjectProcedure;
+
 import java.io.File;
-import java.io.FileFilter;
 import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
-import org.eclipse.mat.SnapshotException;
-import org.eclipse.mat.parser.internal.SnapshotFactory;
-import org.eclipse.mat.snapshot.IPathsFromGCRootsComputer;
-import org.eclipse.mat.snapshot.ISnapshot;
-import org.eclipse.mat.snapshot.PathsFromGCRootsTree;
-import org.eclipse.mat.snapshot.model.Field;
-import org.eclipse.mat.snapshot.model.IArray;
-import org.eclipse.mat.snapshot.model.IClass;
-import org.eclipse.mat.snapshot.model.IInstance;
-import org.eclipse.mat.snapshot.model.IObject;
-import org.eclipse.mat.snapshot.model.IObjectArray;
-import org.eclipse.mat.snapshot.model.NamedReference;
-import org.eclipse.mat.snapshot.model.ObjectReference;
-import org.eclipse.mat.snapshot.model.PrettyPrinter;
-import org.eclipse.mat.snapshot.model.ThreadToLocalReference;
-import org.eclipse.mat.util.VoidProgressListener;
 
 import static com.squareup.leakcanary.AnalysisResult.failure;
 import static com.squareup.leakcanary.AnalysisResult.leakDetected;
 import static com.squareup.leakcanary.AnalysisResult.noLeak;
+import static com.squareup.leakcanary.HahaHelper.asString;
+import static com.squareup.leakcanary.HahaHelper.classInstanceValues;
+import static com.squareup.leakcanary.HahaHelper.extendsThread;
+import static com.squareup.leakcanary.HahaHelper.fieldToString;
+import static com.squareup.leakcanary.HahaHelper.fieldValue;
+import static com.squareup.leakcanary.HahaHelper.threadName;
 import static com.squareup.leakcanary.LeakTraceElement.Holder.ARRAY;
 import static com.squareup.leakcanary.LeakTraceElement.Holder.CLASS;
 import static com.squareup.leakcanary.LeakTraceElement.Holder.OBJECT;
 import static com.squareup.leakcanary.LeakTraceElement.Holder.THREAD;
-import static com.squareup.leakcanary.LeakTraceElement.Type.INSTANCE_FIELD;
-import static com.squareup.leakcanary.LeakTraceElement.Type.LOCAL;
-import static com.squareup.leakcanary.LeakTraceElement.Type.STATIC_FIELD;
-import static java.lang.Integer.MAX_VALUE;
-import static java.util.Collections.emptyMap;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 /**
@@ -62,17 +56,10 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 public final class HeapAnalyzer {
 
   private static final String ANONYMOUS_CLASS_NAME_PATTERN = "^.+\\$\\d+$";
-  private static final String TAG = "HeapAnalyzer";
 
-  private final ExcludedRefs baseExcludedRefs;
   private final ExcludedRefs excludedRefs;
 
   public HeapAnalyzer(ExcludedRefs excludedRefs) {
-    this(new ExcludedRefs.Builder().build(), excludedRefs);
-  }
-
-  public HeapAnalyzer(ExcludedRefs baseExcludedRefs, ExcludedRefs excludedRefs) {
-    this.baseExcludedRefs = baseExcludedRefs;
     this.excludedRefs = excludedRefs;
   }
 
@@ -88,303 +75,245 @@ public final class HeapAnalyzer {
       return failure(exception, since(analysisStartNanoTime));
     }
 
-    ISnapshot snapshot = null;
     try {
-      snapshot = openSnapshot(heapDumpFile);
+      HprofBuffer buffer = new MemoryMappedFileBuffer(heapDumpFile);
+      HprofParser parser = new HprofParser(buffer);
+      Snapshot snapshot = parser.parse();
+      deduplicateGcRoots(snapshot);
 
-      IObject leakingRef = findLeakingReference(referenceKey, snapshot);
+      Instance leakingRef = findLeakingReference(referenceKey, snapshot);
 
       // False alarm, weak reference was cleared in between key check and heap dump.
       if (leakingRef == null) {
         return noLeak(since(analysisStartNanoTime));
       }
 
-      String className = leakingRef.getClazz().getName();
-
-      AnalysisResult result =
-          findLeakTrace(analysisStartNanoTime, snapshot, leakingRef, className, true);
-
-      if (!result.leakFound) {
-        result = findLeakTrace(analysisStartNanoTime, snapshot, leakingRef, className, false);
-      }
-
-      return result;
-    } catch (Exception e) {
+      return findLeakTrace(analysisStartNanoTime, snapshot, leakingRef);
+    } catch (Throwable e) {
       return failure(e, since(analysisStartNanoTime));
-    } finally {
-      cleanup(heapDumpFile, snapshot);
     }
   }
 
-  private AnalysisResult findLeakTrace(long analysisStartNanoTime, ISnapshot snapshot,
-      IObject leakingRef, String className, boolean excludingKnownLeaks) throws SnapshotException {
+  /**
+   * Pruning duplicates reduces memory pressure from hprof bloat added in Marshmallow.
+   */
+  void deduplicateGcRoots(Snapshot snapshot) {
+    // THashMap has a smaller memory footprint than HashMap.
+    final THashMap<String, RootObj> uniqueRootMap = new THashMap<>();
 
-    ExcludedRefs excludedRefs = excludingKnownLeaks ? this.excludedRefs : baseExcludedRefs;
+    final List<RootObj> gcRoots = (ArrayList) snapshot.getGCRoots();
+    for (RootObj root : gcRoots) {
+      String key = generateRootKey(root);
+      if (!uniqueRootMap.containsKey(key)) {
+        uniqueRootMap.put(key, root);
+      }
+    }
 
-    PathsFromGCRootsTree gcRootsTree = shortestPathToGcRoots(snapshot, leakingRef, excludedRefs);
+    // Repopulate snapshot with unique GC roots.
+    gcRoots.clear();
+    uniqueRootMap.forEach(new TObjectProcedure<String>() {
+      @Override
+      public boolean execute(String key) {
+        return gcRoots.add(uniqueRootMap.get(key));
+      }
+    });
+  }
+
+  private String generateRootKey(RootObj root) {
+    return String.format("%s@0x%08x", root.getRootType().getName(), root.getId());
+  }
+
+  private Instance findLeakingReference(String key, Snapshot snapshot) {
+    ClassObj refClass = snapshot.findClass(KeyedWeakReference.class.getName());
+    List<String> keysFound = new ArrayList<>();
+    for (Instance instance : refClass.getInstancesList()) {
+      List<ClassInstance.FieldValue> values = classInstanceValues(instance);
+      String keyCandidate = asString(fieldValue(values, "key"));
+      if (keyCandidate.equals(key)) {
+        return fieldValue(values, "referent");
+      }
+      keysFound.add(keyCandidate);
+    }
+    throw new IllegalStateException(
+        "Could not find weak reference with key " + key + " in " + keysFound);
+  }
+
+  private AnalysisResult findLeakTrace(long analysisStartNanoTime, Snapshot snapshot,
+      Instance leakingRef) {
+
+    ShortestPathFinder pathFinder = new ShortestPathFinder(excludedRefs);
+    ShortestPathFinder.Result result = pathFinder.findPath(snapshot, leakingRef);
 
     // False alarm, no strong reference path to GC Roots.
-    if (gcRootsTree == null) {
+    if (result.leakingNode == null) {
       return noLeak(since(analysisStartNanoTime));
     }
 
-    LeakTrace leakTrace = buildLeakTrace(snapshot, gcRootsTree, excludedRefs);
+    LeakTrace leakTrace = buildLeakTrace(result.leakingNode);
 
-    return leakDetected(!excludingKnownLeaks, className, leakTrace, since(analysisStartNanoTime));
+    String className = leakingRef.getClassObj().getClassName();
+
+    // Side effect: computes retained size.
+    snapshot.computeDominators();
+
+    Instance leakingInstance = result.leakingNode.instance;
+
+    long retainedSize = leakingInstance.getTotalRetainedSize();
+
+    retainedSize += computeIgnoredBitmapRetainedSize(snapshot, leakingInstance);
+
+    return leakDetected(result.excludingKnownLeaks, className, leakTrace, retainedSize,
+        since(analysisStartNanoTime));
   }
 
-  private ISnapshot openSnapshot(File heapDumpFile) throws SnapshotException {
-    SnapshotFactory factory = new SnapshotFactory();
-    Map<String, String> args = emptyMap();
-    VoidProgressListener listener = new VoidProgressListener();
-    return factory.openSnapshot(heapDumpFile, args, listener);
-  }
+  /**
+   * Bitmaps and bitmap byte arrays are sometimes held by native gc roots, so they aren't included
+   * in the retained size because their root dominator is a native gc root.
+   * To fix this, we check if the leaking instance is a dominator for each bitmap instance and then
+   * add the bitmap size.
+   *
+   * From experience, we've found that bitmap created in code (Bitmap.createBitmap()) are correctly
+   * accounted for, however bitmaps set in layouts are not.
+   */
+  private int computeIgnoredBitmapRetainedSize(Snapshot snapshot, Instance leakingInstance) {
+    int bitmapRetainedSize = 0;
+    ClassObj bitmapClass = snapshot.findClass("android.graphics.Bitmap");
 
-  private IObject findLeakingReference(String key, ISnapshot snapshot) throws SnapshotException {
-    Collection<IClass> refClasses =
-        snapshot.getClassesByName(KeyedWeakReference.class.getName(), false);
-
-    if (refClasses.size() != 1) {
-      throw new IllegalStateException(
-          "Expecting one class for " + KeyedWeakReference.class.getName() + " in " + refClasses);
-    }
-
-    IClass refClass = refClasses.iterator().next();
-
-    int[] weakRefInstanceIds = refClass.getObjectIds();
-
-    for (int weakRefInstanceId : weakRefInstanceIds) {
-      IObject weakRef = snapshot.getObject(weakRefInstanceId);
-      String keyCandidate =
-          PrettyPrinter.objectAsString((IObject) weakRef.resolveValue("key"), 100);
-      if (keyCandidate.equals(key)) {
-        return (IObject) weakRef.resolveValue("referent");
-      }
-    }
-    throw new IllegalStateException("Could not find weak reference with key " + key);
-  }
-
-  private PathsFromGCRootsTree shortestPathToGcRoots(ISnapshot snapshot, IObject leakingRef,
-      ExcludedRefs excludedRefs) throws SnapshotException {
-    Map<IClass, Set<String>> excludeMap =
-        buildClassExcludeMap(snapshot, excludedRefs.excludeFieldMap);
-
-    IPathsFromGCRootsComputer pathComputer =
-        snapshot.getPathsFromGCRoots(leakingRef.getObjectId(), excludeMap);
-
-    return shortestValidPath(snapshot, pathComputer, excludedRefs);
-  }
-
-  private Map<IClass, Set<String>> buildClassExcludeMap(ISnapshot snapshot,
-      Map<String, Set<String>> excludeMap) throws SnapshotException {
-    Map<IClass, Set<String>> classExcludeMap = new LinkedHashMap<>();
-    for (Map.Entry<String, Set<String>> entry : excludeMap.entrySet()) {
-      Collection<IClass> refClasses = snapshot.getClassesByName(entry.getKey(), false);
-      if (refClasses != null && refClasses.size() == 1) {
-        IClass refClass = refClasses.iterator().next();
-        classExcludeMap.put(refClass, entry.getValue());
-      }
-    }
-    return classExcludeMap;
-  }
-
-  private PathsFromGCRootsTree shortestValidPath(ISnapshot snapshot,
-      IPathsFromGCRootsComputer pathComputer, ExcludedRefs excludedRefs) throws SnapshotException {
-
-    Map<IClass, Set<String>> excludedStaticFields =
-        buildClassExcludeMap(snapshot, excludedRefs.excludeStaticFieldMap);
-
-    int[] shortestPath;
-
-    while ((shortestPath = pathComputer.getNextShortestPath()) != null) {
-      PathsFromGCRootsTree tree = pathComputer.getTree(Collections.singletonList(shortestPath));
-      if (validPath(snapshot, tree, excludedStaticFields, excludedRefs)) {
-        return tree;
-      }
-    }
-    // No more strong reference path.
-    return null;
-  }
-
-  private boolean validPath(ISnapshot snapshot, PathsFromGCRootsTree tree,
-      Map<IClass, Set<String>> excludedStaticFields, ExcludedRefs excludedRefs)
-      throws SnapshotException {
-    if (excludedStaticFields.isEmpty() && excludedRefs.excludedThreads.isEmpty()) {
-      return true;
-    }
-    // Note: the first child is the leaking object, the last child is the GC root.
-    IObject held = null;
-    while (tree != null) {
-      IObject holder = snapshot.getObject(tree.getOwnId());
-      // Static field reference
-      if (holder instanceof IClass) {
-        IClass childClass = (IClass) holder;
-        Set<String> childClassExcludedFields = excludedStaticFields.get(childClass);
-        if (childClassExcludedFields != null) {
-          NamedReference ref = findHeldInHolder(held, holder, excludedRefs);
-          if (ref != null && childClassExcludedFields.contains(ref.getName())) {
-            return false;
-          }
+    for (Instance bitmapInstance : bitmapClass.getInstancesList()) {
+      if (isIgnoredDominator(leakingInstance, bitmapInstance)) {
+        ArrayInstance mBufferInstance = fieldValue(classInstanceValues(bitmapInstance), "mBuffer");
+        // Native bitmaps have mBuffer set to null. We sadly can't account for them.
+        if (mBufferInstance == null) {
+          continue;
         }
-      } else if (holder.getClazz().doesExtend(Thread.class.getName())) {
-        if (excludedRefs.excludedThreads.contains(getThreadName(holder))) {
-          return false;
+        long bufferSize = mBufferInstance.getTotalRetainedSize();
+        long bitmapSize = bitmapInstance.getTotalRetainedSize();
+        // Sometimes the size of the buffer isn't accounted for in the bitmap retained size. Since
+        // the buffer is large, it's easy to detect by checking for bitmap size < buffer size.
+        if (bitmapSize < bufferSize) {
+          bitmapSize += bufferSize;
         }
-      }
-      held = holder;
-      int[] branchIds = tree.getObjectIds();
-      tree = branchIds.length > 0 ? tree.getBranch(branchIds[0]) : null;
-    }
-    return true;
-  }
-
-  private String getThreadName(IObject thread) throws SnapshotException {
-    return PrettyPrinter.objectAsString((IObject) thread.resolveValue("name"), MAX_VALUE);
-  }
-
-  private NamedReference findHeldInHolder(IObject held, IObject holder, ExcludedRefs excludedRefs)
-      throws SnapshotException {
-    if (held == null) {
-      return null;
-    }
-    Set<String> excludedFields = excludedRefs.excludeFieldMap.get(holder.getClazz().getName());
-    for (NamedReference holdingRef : holder.getOutboundReferences()) {
-      if (holdingRef.getObjectId() == held.getObjectId() && (excludedFields == null
-          || !excludedFields.contains(holdingRef.getName()))) {
-        return holdingRef;
+        bitmapRetainedSize += bitmapSize;
       }
     }
-    return null;
+    return bitmapRetainedSize;
   }
 
-  private LeakTrace buildLeakTrace(ISnapshot snapshot, PathsFromGCRootsTree tree,
-      ExcludedRefs excludedRefs) throws SnapshotException {
+  private boolean isIgnoredDominator(Instance dominator, Instance instance) {
+    boolean foundNativeRoot = false;
+    while (true) {
+      Instance immediateDominator = instance.getImmediateDominator();
+      if (immediateDominator instanceof RootObj
+          && ((RootObj) immediateDominator).getRootType() == RootType.UNKNOWN) {
+        // Ignore native roots
+        instance = instance.getNextInstanceToGcRoot();
+        foundNativeRoot = true;
+      } else {
+        instance = immediateDominator;
+      }
+      if (instance == null) {
+        return false;
+      }
+      if (instance == dominator) {
+        return foundNativeRoot;
+      }
+    }
+  }
+
+  private LeakTrace buildLeakTrace(LeakNode leakingNode) {
     List<LeakTraceElement> elements = new ArrayList<>();
     // We iterate from the leak to the GC root
-    IObject held = null;
-    while (tree != null) {
-      IObject holder = snapshot.getObject(tree.getOwnId());
-      elements.add(0, buildLeakElement(held, holder, excludedRefs));
-      held = holder;
-      int[] branchIds = tree.getObjectIds();
-      tree = branchIds.length > 0 ? tree.getBranch(branchIds[0]) : null;
+    LeakNode node = new LeakNode(null, null, leakingNode, null, null);
+    while (node != null) {
+      LeakTraceElement element = buildLeakElement(node);
+      if (element != null) {
+        elements.add(0, element);
+      }
+      node = node.parent;
     }
     return new LeakTrace(elements);
   }
 
-  private LeakTraceElement buildLeakElement(IObject held, IObject holder, ExcludedRefs excludedRefs)
-      throws SnapshotException {
-    LeakTraceElement.Type type = null;
-    String referenceName = null;
-    NamedReference holdingRef = findHeldInHolder(held, holder, excludedRefs);
-    if (holdingRef != null) {
-      referenceName = holdingRef.getName();
-      if (holder instanceof IClass) {
-        type = STATIC_FIELD;
-      } else if (holdingRef instanceof ThreadToLocalReference) {
-        type = LOCAL;
-      } else {
-        type = INSTANCE_FIELD;
-      }
+  private LeakTraceElement buildLeakElement(LeakNode node) {
+    if (node.parent == null) {
+      // Ignore any root node.
+      return null;
     }
+    Instance holder = node.parent.instance;
+
+    if (holder instanceof RootObj) {
+      return null;
+    }
+    LeakTraceElement.Type type = node.referenceType;
+    String referenceName = node.referenceName;
 
     LeakTraceElement.Holder holderType;
     String className;
     String extra = null;
     List<String> fields = new ArrayList<>();
-    if (holder instanceof IClass) {
-      IClass clazz = (IClass) holder;
+    if (holder instanceof ClassObj) {
+      ClassObj classObj = (ClassObj) holder;
       holderType = CLASS;
-      className = clazz.getName();
-      for (Field staticField : clazz.getStaticFields()) {
-        fields.add("static " + fieldToString(staticField));
+      className = classObj.getClassName();
+      for (Map.Entry<Field, Object> entry : classObj.getStaticFieldValues().entrySet()) {
+        Field field = entry.getKey();
+        Object value = entry.getValue();
+        fields.add("static " + field.getName() + " = " + value);
       }
-    } else if (holder instanceof IArray) {
+    } else if (holder instanceof ArrayInstance) {
+      ArrayInstance arrayInstance = (ArrayInstance) holder;
       holderType = ARRAY;
-      IClass clazz = holder.getClazz();
-      className = clazz.getName();
-      if (holder instanceof IObjectArray) {
-        IObjectArray array = (IObjectArray) holder;
-        int i = 0;
-        ISnapshot snapshot = holder.getSnapshot();
-        for (long address : array.getReferenceArray()) {
-          if (address == 0) {
-            fields.add("[" + i + "] = null");
-          } else {
-            int objectId = snapshot.mapAddressToId(address);
-            IObject object = snapshot.getObject(objectId);
-            fields.add("[" + i + "] = " + object);
-          }
-          i++;
+      className = arrayInstance.getClassObj().getClassName();
+      if (arrayInstance.getArrayType() == Type.OBJECT) {
+        Object[] values = arrayInstance.getValues();
+        for (int i = 0; i < values.length; i++) {
+          fields.add("[" + i + "] = " + values[i]);
         }
       }
     } else {
-      IInstance instance = (IInstance) holder;
-      IClass clazz = holder.getClazz();
-      for (Field staticField : clazz.getStaticFields()) {
-        fields.add("static " + fieldToString(staticField));
+      ClassInstance classInstance = (ClassInstance) holder;
+      ClassObj classObj = holder.getClassObj();
+      for (Map.Entry<Field, Object> entry : classObj.getStaticFieldValues().entrySet()) {
+        fields.add("static " + fieldToString(entry));
       }
-      for (Field field : instance.getFields()) {
+      for (ClassInstance.FieldValue field : classInstance.getValues()) {
         fields.add(fieldToString(field));
       }
-      className = clazz.getName();
-      if (clazz.doesExtend(Thread.class.getName())) {
+      className = classObj.getClassName();
+
+      if (extendsThread(classObj)) {
         holderType = THREAD;
-        String threadName = getThreadName(holder);
+        String threadName = threadName(holder);
         extra = "(named '" + threadName + "')";
       } else if (className.matches(ANONYMOUS_CLASS_NAME_PATTERN)) {
-        String parentClassName = clazz.getSuperClass().getName();
+        String parentClassName = classObj.getSuperClassObj().getClassName();
         if (Object.class.getName().equals(parentClassName)) {
           holderType = OBJECT;
-          // This is an anonymous class implementing an interface. The API does not give access
-          // to the interfaces implemented by the class. Let's see if it's in the class path and
-          // use that instead.
           try {
-            Class<?> actualClass = Class.forName(clazz.getName());
-            Class<?> implementedInterface = actualClass.getInterfaces()[0];
-            extra = "(anonymous class implements " + implementedInterface.getName() + ")";
+            // This is an anonymous class implementing an interface. The API does not give access
+            // to the interfaces implemented by the class. We check if it's in the class path and
+            // use that instead.
+            Class<?> actualClass = Class.forName(classObj.getClassName());
+            Class<?>[] interfaces = actualClass.getInterfaces();
+            if (interfaces.length > 0) {
+              Class<?> implementedInterface = interfaces[0];
+              extra = "(anonymous implementation of " + implementedInterface.getName() + ")";
+            } else {
+              extra = "(anonymous subclass of java.lang.Object)";
+            }
           } catch (ClassNotFoundException ignored) {
           }
         } else {
           holderType = OBJECT;
           // Makes it easier to figure out which anonymous class we're looking at.
-          extra = "(anonymous class extends " + parentClassName + ")";
+          extra = "(anonymous subclass of " + parentClassName + ")";
         }
       } else {
         holderType = OBJECT;
       }
     }
-    return new LeakTraceElement(referenceName, type, holderType, className, extra, fields);
-  }
-
-  private String fieldToString(Field field) throws SnapshotException {
-    Object value = field.getValue();
-    if (value instanceof ObjectReference) {
-      value = ((ObjectReference) value).getObject();
-    }
-    return field.getName() + " = " + value;
-  }
-
-  private void cleanup(File heapDumpFile, ISnapshot snapshot) {
-    if (snapshot != null) {
-      snapshot.dispose();
-    }
-    final String heapDumpFileName = heapDumpFile.getName();
-    final String prefix =
-        heapDumpFileName.substring(0, heapDumpFile.getName().length() - ".hprof".length());
-    File[] toRemove = heapDumpFile.getParentFile().listFiles(new FileFilter() {
-      @Override public boolean accept(File file) {
-        return !file.isDirectory() && file.getName().startsWith(prefix) && !file.getName()
-            .equals(heapDumpFileName);
-      }
-    });
-    if (toRemove != null) {
-      for (File file : toRemove) {
-        file.delete();
-      }
-    } else {
-      Log.d(TAG, "Could not find HAHA files to cleanup.");
-    }
+    return new LeakTraceElement(referenceName, type, holderType, className, extra, node.exclusion,
+        fields);
   }
 
   private long since(long analysisStartNanoTime) {

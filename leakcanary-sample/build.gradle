@@ -26,4 +26,12 @@ android {
   buildTypes {
     debug
   }
+
+  dexOptions {
+    dexInProcess false
+  }
+
+  lintOptions {
+    disable 'GoogleAppIndexingWarning'
+  }
 }

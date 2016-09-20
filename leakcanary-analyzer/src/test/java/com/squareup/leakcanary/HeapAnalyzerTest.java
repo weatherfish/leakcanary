@@ -1,83 +1,61 @@
-/*
- * Copyright (C) 2015 Square, Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
 package com.squareup.leakcanary;
 
-import java.io.File;
+import com.squareup.haha.perflib.RootObj;
+import com.squareup.haha.perflib.Snapshot;
+
+import org.junit.Before;
 import org.junit.Test;
 
-import static com.squareup.leakcanary.LeakTraceElement.Holder.THREAD;
-import static com.squareup.leakcanary.LeakTraceElement.Type.STATIC_FIELD;
-import static org.hamcrest.core.StringContains.containsString;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertThat;
-import static org.junit.Assert.assertTrue;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+
+import static com.squareup.haha.perflib.RootType.NATIVE_STATIC;
+import static com.squareup.haha.perflib.RootType.SYSTEM_CLASS;
+import static java.util.Arrays.asList;
+import static org.assertj.core.api.Assertions.assertThat;
 
 public class HeapAnalyzerTest {
+  private static final ExcludedRefs NO_EXCLUDED_REFS = null;
+  private static final List<RootObj> DUP_ROOTS =
+          asList(new RootObj(SYSTEM_CLASS, 6L),
+                  new RootObj(SYSTEM_CLASS, 5L),
+                  new RootObj(SYSTEM_CLASS, 3L),
+                  new RootObj(SYSTEM_CLASS, 5L),
+                  new RootObj(NATIVE_STATIC, 3L));
 
-  static final ExcludedRefs NONE = new ExcludedRefs.Builder().build();
+  private HeapAnalyzer heapAnalyzer;
 
-  static final String ASYNC_TASK_THREAD = "AsyncTask #1";
-  static final String ASYNC_TASK_CLASS = "android.os.AsyncTask";
-  static final String EXECUTOR_FIELD = "SERIAL_EXECUTOR";
-
-  @Test public void leakFound() {
-    AnalysisResult result = analyze(new HeapAnalyzer(NONE));
-    LeakTraceElement gcRoot = result.leakTrace.elements.get(0);
-    assertTrue(result.leakFound);
-    assertFalse(result.excludedLeak);
-    assertEquals(Thread.class.getName(), gcRoot.className);
-    assertEquals(THREAD, gcRoot.holder);
-    assertThat(gcRoot.extra, containsString(ASYNC_TASK_THREAD));
+  @Before
+  public void setUp() {
+    heapAnalyzer = new HeapAnalyzer(NO_EXCLUDED_REFS);
   }
 
-  @Test public void excludeThread() {
-    ExcludedRefs.Builder excludedRefs = new ExcludedRefs.Builder();
-    excludedRefs.thread(ASYNC_TASK_THREAD);
-    AnalysisResult result = analyze(new HeapAnalyzer(excludedRefs.build()));
-    assertTrue(result.leakFound);
-    assertFalse(result.excludedLeak);
-    LeakTraceElement gcRoot = result.leakTrace.elements.get(0);
-    assertEquals(ASYNC_TASK_CLASS, gcRoot.className);
-    assertEquals(STATIC_FIELD, gcRoot.type);
-    assertEquals(EXECUTOR_FIELD, gcRoot.referenceName);
+  @Test
+  public void ensureUniqueRoots() {
+    Snapshot snapshot = createSnapshot(DUP_ROOTS);
+
+    heapAnalyzer.deduplicateGcRoots(snapshot);
+
+    Collection<RootObj> uniqueRoots = snapshot.getGCRoots();
+    assertThat(uniqueRoots).hasSize(4);
+
+    List<Long> rootIds = new ArrayList<>();
+    for (RootObj root : uniqueRoots) {
+      rootIds.add(root.getId());
+    }
+    Collections.sort(rootIds);
+
+    // 3 appears twice because even though two RootObjs have the same id, they're different types.
+    assertThat(rootIds).containsExactly(3L, 3L, 5L, 6L);
   }
 
-  @Test public void excludeStatic() {
-    ExcludedRefs.Builder excludedRefs = new ExcludedRefs.Builder();
-    excludedRefs.thread(ASYNC_TASK_THREAD);
-    excludedRefs.staticField(ASYNC_TASK_CLASS, EXECUTOR_FIELD);
-    AnalysisResult result = analyze(new HeapAnalyzer(excludedRefs.build()));
-    assertTrue(result.leakFound);
-    assertTrue(result.excludedLeak);
-  }
-
-  @Test public void excludeStaticForBase() {
-    ExcludedRefs.Builder excludedRefs = new ExcludedRefs.Builder();
-    excludedRefs.thread(ASYNC_TASK_THREAD);
-    excludedRefs.staticField(ASYNC_TASK_CLASS, EXECUTOR_FIELD);
-    AnalysisResult result = analyze(new HeapAnalyzer(excludedRefs.build(), excludedRefs.build()));
-    assertFalse(result.leakFound);
-  }
-
-  private AnalysisResult analyze(HeapAnalyzer heapAnalyzer) {
-    File heapDumpFile = new File(Thread.currentThread()
-        .getContextClassLoader()
-        .getResource("leak_asynctask.hprof")
-        .getPath());
-    return heapAnalyzer.checkForLeak(heapDumpFile, "dc983a12-d029-4003-8890-7dd644c664c5");
+  private Snapshot createSnapshot(List<RootObj> gcRoots) {
+    Snapshot snapshot = new Snapshot(null);
+    for (RootObj root : gcRoots) {
+      snapshot.addRoot(root);
+    }
+    return snapshot;
   }
 }

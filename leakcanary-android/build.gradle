@@ -22,6 +22,7 @@ def gitSha() {
 }
 
 android {
+  resourcePrefix 'leak_canary_'
   compileSdkVersion rootProject.ext.compileSdkVersion
   buildToolsVersion rootProject.ext.buildToolsVersion
   defaultConfig {
@@ -30,6 +31,9 @@ android {
     buildConfigField "String", "LIBRARY_VERSION", "\"${rootProject.ext.VERSION_NAME}\""
     buildConfigField "String", "GIT_SHA", "\"${gitSha()}\""
     consumerProguardFiles 'consumer-proguard-rules.pro'
+  }
+  lintOptions {
+    disable 'GoogleAppIndexingWarning'
   }
 }
 
